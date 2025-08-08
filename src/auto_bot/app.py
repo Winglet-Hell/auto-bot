@@ -1,6 +1,8 @@
 import asyncio
 import os
 import time
+import json
+import re
 from urllib.parse import urlsplit, urlunsplit
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from threading import Thread
@@ -75,26 +77,55 @@ HIGHLIGHT_COLOR = os.getenv("HIGHLIGHT_COLOR", "rgba(0, 200, 255, 0.35)")
 GRID_SCROLL_SELECTOR = os.getenv("GRID_SCROLL_SELECTOR", "")
 
 # Предустановленные пресеты (можно расширять)
-PRESETS = [
-    {
-        "name": "Default (env)",
-        "url": START_URL,
-        "username": os.getenv("SP_USERNAME", ""),
-        "password": os.getenv("SP_PASSWORD", ""),
-    },
-    {
-        "name": "Fashion (addrea)",
-        "url": "https://fashion.smartplayer.org/#/broadcasts?folderId=33",
-        "username": "fashion@addrea.com",
-        "password": "7zsF9On1",
-    },
-    {
-        "name": "Neftm Local",
-        "url": "http://smartplayer1.neftm.local/cms/#/broadcasts?folderId=1",
-        "username": "content_w@addrea.com",
-        "password": "1vNpvNX_ob-n",
-    },
-]
+PROFILES_PATH = os.getenv("PROFILES_PATH", "var/profiles.json")
+PROFILES_STATE: dict[str, list[dict[str, str]]] = {"profiles": []}
+
+def get_default_profiles() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "Аккаунт 1",
+            "url": START_URL,
+            "username": os.getenv("SP_USERNAME", ""),
+            "password": os.getenv("SP_PASSWORD", ""),
+        },
+        {"name": "Аккаунт 2", "url": "", "username": "", "password": ""},
+        {"name": "Аккаунт 3", "url": "", "username": "", "password": ""},
+    ]
+
+def load_profiles() -> list[dict[str, str]]:
+    try:
+        with open(PROFILES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            # нормализуем ключи
+            result: list[dict[str, str]] = []
+            for p in data:
+                if not isinstance(p, dict):
+                    continue
+                result.append(
+                    {
+                        "name": str(p.get("name", "Профиль")),
+                        "url": str(p.get("url", "")),
+                        "username": str(p.get("username", "")),
+                        "password": str(p.get("password", "")),
+                    }
+                )
+            if result:
+                return result
+    except Exception:
+        pass
+    return get_default_profiles()
+
+def save_profiles(profiles: list[dict[str, str]]) -> None:
+    try:
+        profile_dir = os.path.dirname(PROFILES_PATH)
+        if profile_dir:
+            os.makedirs(profile_dir, exist_ok=True)
+        with open(PROFILES_PATH, "w", encoding="utf-8") as f:
+            json.dump(profiles, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    PROFILES_STATE["profiles"] = profiles
 
 async def highlight_locator(page, locator):
     if not SHOW_CLICKS:
@@ -115,6 +146,9 @@ async def highlight_locator(page, locator):
 # ====== Скорость выполнения (слайдер UI) ======
 SPEED_DEFAULT = float(os.getenv("SPEED", "1.0"))  # 1.0 — базовая скорость
 SPEED_STATE = {"value": SPEED_DEFAULT}
+STOP_FLAG = {"stop": False}
+BOT_STATE = {"running": False}
+ACTIVE_PROFILE_NAME = {"name": "Аккаунт 1"}
 
 def TO(ms: int) -> int:
     # Таймауты: уменьшаем при увеличении скорости, но не ниже 500 мс
@@ -125,6 +159,9 @@ def AD(ms: int) -> int:
     # Задержки/ожидания: уменьшаем при увеличении скорости, но не ниже 50 мс
     factor = SPEED_STATE["value"] if SPEED_STATE["value"] > 0 else 1.0
     return max(50, int(ms / factor))
+
+def request_stop() -> None:
+    STOP_FLAG["stop"] = True
 
 def run_speed_slider_ui_main_thread(start_bot_callable) -> None:
     """Запускает Tkinter-слайдер в главном потоке, а бота — в отдельном."""
@@ -237,8 +274,8 @@ TILE_PREVIEW_SELECTOR = os.getenv(
 # Ожидание авторизации (первый запуск), 10 минут
 LOGIN_WAIT_TIMEOUT = 10 * 60 * 1000
 
-# Путь к сохранённому состоянию сессии
-STATE_PATH = "state.json"
+# Путь к сохранённому состоянию сессии (хранится в var/ по умолчанию)
+STATE_PATH = os.getenv("STATE_PATH", "var/state.json")
 
 # Настройки авто-логина
 AUTO_LOGIN_ENABLED = True
@@ -486,6 +523,9 @@ async def process_all(page):
     seen_titles: set[str] = set()
     seen_tile_ids: set[str] = set()
     while True:
+        # Пауза: не закрываемся, просто ждём
+        while STOP_FLAG["stop"]:
+            await page.wait_for_timeout(300)
         count_icons = await page.locator(ICON_SELECTOR).count()
         log(f"На странице найдено карточек (иконок): {count_icons}")
         if count_icons == 0:
@@ -494,6 +534,8 @@ async def process_all(page):
                 log("Карточек не видно — жду, пока вы откроете нужный раздел...")
                 started = time.time()
                 while True:
+                    while STOP_FLAG["stop"]:
+                        await page.wait_for_timeout(300)
                     await page.wait_for_timeout(POLL_INTERVAL_MS)
                     count_icons = await page.locator(ICON_SELECTOR).count()
                     if count_icons > 0:
@@ -520,6 +562,8 @@ async def process_all(page):
 
         opened_any = False
         for i in range(tiles_count):
+            while STOP_FLAG["stop"]:
+                await page.wait_for_timeout(300)
             tile = tiles.nth(i)
             # стабильный уникальный id контейнера
             tile_id = None
@@ -574,170 +618,392 @@ async def process_all(page):
                 continue
 
 async def main():
-    async with async_playwright() as p:
-        log("Запускаю браузер Chromium (видимое окно)")
-        browser = await p.chromium.launch(headless=False)  # видно окно
-        # Если заданы логин/пароль или включён FORCE_LOGIN — игнорируем сохранённую сессию
-        creds_present = bool(os.getenv(USERNAME_ENV)) and bool(os.getenv(PASSWORD_ENV))
-        force_login = os.getenv(FORCE_LOGIN_ENV, "0") != "0" or creds_present
-        use_saved_state = os.path.exists(STATE_PATH) and not force_login
-        context = await browser.new_context(
-            storage_state=STATE_PATH if use_saved_state else None
-        )
-        if use_saved_state:
-            log("Использую сохранённую сессию")
-        else:
-            if force_login:
-                log("Игнорирую сохранённую сессию: выполню авто‑логин с указанными данными")
-            else:
-                log("Сохранённая сессия не найдена")
-        page = await context.new_page()
-        # Если ожидается логин — сразу идём на #/login, иначе на START_URL
-        login_hash_url = None
-        if force_login:
-            parts = urlsplit(START_URL)
-            base = parts.scheme + '://' + parts.netloc + (parts.path or '/')
-            login_hash_url = base + '#/login'
-        await page.goto(login_hash_url or START_URL, wait_until="load")
-        log(f"Открыл страницу: {login_hash_url or START_URL}")
-
-        # Определяем, требуется ли логин (редирект на /login или видим форму логина)
-        login_required = force_login
-        try:
-            await page.wait_for_load_state("networkidle", timeout=TO(1500))
-        except Exception:
-            pass
-        if (not login_required) and ("login" in page.url):
-            login_required = True
-        else:
+    BOT_STATE["running"] = True
+    try:
+        async with async_playwright() as p:
+            log("Запускаю браузер Chromium (видимое окно)")
+            browser = await p.chromium.launch(headless=False)
+            context = None
             try:
-                if await page.locator('input[type="password"]').count() > 0:
-                    login_required = True
-            except Exception:
-                pass
-
-        # Если нет сессии, запрошен принудительный вход или она невалидна — логинимся (сначала авто, затем вручную)
-        if (not use_saved_state) or login_required:
-            auto_ok = await attempt_auto_login(page)
-            if not auto_ok:
-                log("Ожидаю ручной вход (до 10 минут)...")
+                # Если заданы логин/пароль или включён FORCE_LOGIN — игнорируем сохранённую сессию
+                creds_present = bool(os.getenv(USERNAME_ENV)) and bool(os.getenv(PASSWORD_ENV))
+                force_login = os.getenv(FORCE_LOGIN_ENV, "0") != "0" or creds_present
+                use_saved_state = os.path.exists(STATE_PATH) and not force_login
+                context = await browser.new_context(
+                    storage_state=STATE_PATH if use_saved_state else None
+                )
+                if use_saved_state:
+                    log("Использую сохранённую сессию")
+                else:
+                    if force_login:
+                        log("Игнорирую сохранённую сессию: выполню авто‑логин с указанными данными")
+                    else:
+                        log("Сохранённая сессия не найдена")
+                page = await context.new_page()
+                # Если ожидается логин — сразу идём на #/login, иначе на START_URL
+                login_hash_url = None
+                if force_login:
+                    parts = urlsplit(START_URL)
+                    base = parts.scheme + '://' + parts.netloc + (parts.path or '/')
+                    login_hash_url = base + '#/login'
                 try:
-                    await page.locator('text=Log out, text=Выйти').first.wait_for(timeout=2000)
-                except PWTimeout:
-                    # Ждём появления целевых элементов на странице трансляций
-                    try:
-                        await page.locator(ICON_SELECTOR).first.wait_for(timeout=LOGIN_WAIT_TIMEOUT)
-                    except PWTimeout:
-                        log("Не дождался ручного входа — завершаю")
-                        await context.close()
-                        await browser.close()
-                        return
-            # Сохраняем сессию и переходим к стартовой странице
-            try:
-                await context.storage_state(path=STATE_PATH)
-                log(f"Сессия сохранена: {STATE_PATH}")
-            except Exception:
-                pass
-            await page.goto(START_URL, wait_until="load")
+                    await page.goto(login_hash_url or START_URL, wait_until="domcontentloaded", timeout=TO(45000))
+                except Exception as e:
+                    log(f"Переход на страницу не удался: {e}")
+                log(f"Открыл страницу: {login_hash_url or START_URL}")
 
-        await process_all(page)
-        # Задержка перед закрытием окна (по желанию)
-        if HOLD_OPEN_SECONDS > 0:
-            log(f"Оставляю окно открытым ещё {HOLD_OPEN_SECONDS} сек")
-            await page.wait_for_timeout(HOLD_OPEN_SECONDS * 1000)
-        log("Закрываю браузер")
-        await context.close()
-        await browser.close()
+                # Определяем, требуется ли логин (редирект на /login или видим форму логина)
+                login_required = force_login
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=TO(1500))
+                except Exception:
+                    pass
+                # Пауза до авторизации
+                while STOP_FLAG["stop"]:
+                    await page.wait_for_timeout(300)
+                if (not login_required) and ("login" in page.url):
+                    login_required = True
+                else:
+                    try:
+                        if await page.locator('input[type="password"]').count() > 0:
+                            login_required = True
+                    except Exception:
+                        pass
+
+                # Если нет сессии, запрошен принудительный вход или она невалидна — логинимся (сначала авто, затем вручную)
+                if (not use_saved_state) or login_required:
+                    auto_ok = await attempt_auto_login(page)
+                    if not auto_ok:
+                        log("Ожидаю ручной вход (до 10 минут)...")
+                        # Периодически проверяем, чтобы можно было остановить
+                        started = time.time()
+                        while True:
+                            while STOP_FLAG["stop"]:
+                                await page.wait_for_timeout(300)
+                            try:
+                                await page.locator('text=Log out, text=Выйти').first.wait_for(timeout=800)
+                                break
+                            except Exception:
+                                pass
+                            try:
+                                await page.locator(ICON_SELECTOR).first.wait_for(timeout=800)
+                                break
+                            except Exception:
+                                pass
+                            if (time.time() - started) * 1000 > LOGIN_WAIT_TIMEOUT:
+                                log("Не дождался ручного входа — завершаю")
+                                return
+                    # Сохраняем сессию и переходим к стартовой странице
+                    try:
+                        state_dir = os.path.dirname(STATE_PATH)
+                        if state_dir:
+                            os.makedirs(state_dir, exist_ok=True)
+                        await context.storage_state(path=STATE_PATH)
+                        log(f"Сессия сохранена: {STATE_PATH}")
+                    except Exception:
+                        pass
+                    while STOP_FLAG["stop"]:
+                        await page.wait_for_timeout(300)
+                    try:
+                        await page.goto(START_URL, wait_until="domcontentloaded", timeout=TO(45000))
+                    except Exception as e:
+                        log(f"Переход на стартовую страницу не удался: {e}")
+
+                # Основной цикл
+                try:
+                    await process_all(page)
+                except Exception as e:
+                    log(f"Ошибка в процессе обработки: {e}")
+            finally:
+                # Закрываем браузер, если ещё открыт
+                try:
+                    if context:
+                        await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+    finally:
+        BOT_STATE["running"] = False
 
 def run_control_panel_main_thread() -> None:
-    """GUI-панель: URL, логин, пароль, скорость и кнопка Запустить."""
+    """Modernized GUI using ttk with profiles sidebar and details pane."""
     try:
         import tkinter as tk
+        from tkinter import ttk
 
         root = tk.Tk()
-        root.title("Auto Bot Control")
+        root.title("Управление Auto Bot")
+        try:
+            root.iconify(); root.update(); root.deiconify()
+        except Exception:
+            pass
+        root.minsize(780, 360)
+        root.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=0)
+        root.columnconfigure(1, weight=1)
 
-        # Переменные полей
-        preset_names = [p["name"] for p in PRESETS]
-        preset_var = tk.StringVar(value=preset_names[0])
-        url_var = tk.StringVar(value=START_URL)
-        user_var = tk.StringVar(value=os.getenv("SP_USERNAME", ""))
-        pwd_var = tk.StringVar(value=os.getenv("SP_PASSWORD", ""))
+        # Use a nicer theme if available
+        try:
+            style = ttk.Style()
+            for theme in ("aqua", "clam", "default"):
+                if theme in style.theme_names():
+                    style.theme_use(theme)
+                    break
+        except Exception:
+            pass
 
-        def on_preset_change(selection: str):
-            preset = next((p for p in PRESETS if p["name"] == selection), PRESETS[0])
-            url_var.set(preset.get("url", ""))
-            user_var.set(preset.get("username", ""))
-            pwd_var.set(preset.get("password", ""))
-
-        # Preset selector
-        tk.Label(root, text="Preset").grid(row=0, column=0, sticky="w", padx=8, pady=(8,2))
-        preset_menu = tk.OptionMenu(root, preset_var, *preset_names, command=on_preset_change)
-        preset_menu.grid(row=0, column=1, sticky="w", padx=8, pady=(8,2))
-
-        # URL
-        tk.Label(root, text="Start URL").grid(row=1, column=0, sticky="w", padx=8, pady=(4,2))
-        url_entry = tk.Entry(root, width=60, textvariable=url_var)
-        url_entry.grid(row=1, column=1, padx=8, pady=(4,2))
-
-        # Username / Password
-        tk.Label(root, text="Username").grid(row=2, column=0, sticky="w", padx=8, pady=2)
-        user_entry = tk.Entry(root, width=30, textvariable=user_var)
-        user_entry.grid(row=2, column=1, sticky="w", padx=8, pady=2)
-
-        tk.Label(root, text="Password").grid(row=3, column=0, sticky="w", padx=8, pady=2)
-        # Не скрываем пароль по просьбе пользователя
-        pwd_entry = tk.Entry(root, width=30, textvariable=pwd_var)
-        pwd_entry.grid(row=3, column=1, sticky="w", padx=8, pady=2)
-
-        # Speed slider
-        tk.Label(root, text="Speed (x)").grid(row=4, column=0, sticky="w", padx=8, pady=(8,2))
+        # State
+        PROFILES_STATE["profiles"] = load_profiles()
+        url_var = tk.StringVar()
+        user_var = tk.StringVar()
+        pwd_var = tk.StringVar()
         speed_var = tk.DoubleVar(value=SPEED_STATE["value"])
-        speed_scale = tk.Scale(root, from_=0.2, to=3.0, orient="horizontal", resolution=0.1, length=320,
-                               variable=speed_var)
-        speed_scale.grid(row=4, column=1, sticky="w", padx=8, pady=(8,2))
+        selected_name = tk.StringVar(value=PROFILES_STATE["profiles"][0]["name"] if PROFILES_STATE["profiles"] else "")
 
-        status_var = tk.StringVar(value="Готов к запуску")
-        tk.Label(root, textvariable=status_var).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(4,6))
+        # Left: profiles
+        left = ttk.Frame(root, padding=(10,10,6,10))
+        left.grid(row=0, column=0, sticky="nsw")
+        left.rowconfigure(1, weight=1)
+        ttk.Label(left, text="Профили", font=("", 11, "bold")).grid(row=0, column=0, sticky="w")
+        profiles_listbox = tk.Listbox(left, height=14, activestyle="dotbox")
+        profiles_scroll = ttk.Scrollbar(left, orient="vertical", command=profiles_listbox.yview)
+        profiles_listbox.configure(yscrollcommand=profiles_scroll.set)
+        profiles_listbox.grid(row=1, column=0, sticky="nsew", pady=(6,6))
+        profiles_scroll.grid(row=1, column=1, sticky="ns", pady=(6,6), padx=(6,0))
+
+        btns = ttk.Frame(left)
+        btns.grid(row=2, column=0, columnspan=2, sticky="ew")
+        create_btn = ttk.Button(btns, text="Создать")
+        rename_btn = ttk.Button(btns, text="Переименовать")
+        delete_btn = ttk.Button(btns, text="Удалить")
+        create_btn.grid(row=0, column=0, padx=(0,6))
+        rename_btn.grid(row=0, column=1, padx=(0,6))
+        delete_btn.grid(row=0, column=2)
+
+        # Right: details
+        right = ttk.Frame(root, padding=(6,10,10,10))
+        right.grid(row=0, column=1, sticky="nsew")
+        for i in range(6):
+            right.rowconfigure(i, weight=0)
+        right.rowconfigure(6, weight=1)
+        right.columnconfigure(1, weight=1)
+
+        ttk.Label(right, text="Детали профиля", font=("", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(right, text="Ссылка для входа").grid(row=1, column=0, sticky="w", pady=(10,4))
+        url_entry = ttk.Entry(right, textvariable=url_var)
+        url_entry.grid(row=1, column=1, sticky="ew", pady=(10,4))
+
+        ttk.Label(right, text="Логин").grid(row=2, column=0, sticky="w", pady=4)
+        user_entry = ttk.Entry(right, textvariable=user_var, width=40)
+        user_entry.grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(right, text="Пароль").grid(row=3, column=0, sticky="w", pady=4)
+        pwd_entry = ttk.Entry(right, textvariable=pwd_var, width=40)
+        pwd_entry.grid(row=3, column=1, sticky="w", pady=4)
+
+        # Speed
+        speed_row = ttk.Frame(right)
+        speed_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10,4))
+        ttk.Label(speed_row, text="Скорость (x)").grid(row=0, column=0, sticky="w")
+        speed_value_lbl = ttk.Label(speed_row, text=f"{speed_var.get():.1f}")
+        speed_value_lbl.grid(row=0, column=1, sticky="w", padx=(6,10))
+        speed_scale = ttk.Scale(speed_row, from_=0.2, to=3.0, orient="horizontal", variable=speed_var, length=360)
+        speed_scale.grid(row=0, column=2, sticky="ew")
+        speed_row.columnconfigure(2, weight=1)
+
+        # Controls
+        controls = ttk.Frame(right)
+        controls.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10,0))
+        start_btn = ttk.Button(controls, text="Запустить")
+        stop_btn = ttk.Button(controls, text="Пауза", state="disabled")
+        start_btn.grid(row=0, column=0, padx=(0,8))
+        stop_btn.grid(row=0, column=1)
+
+        # Status bar
+        status_var = tk.StringVar(value="Выберите профиль слева, отредактируйте параметры и запустите")
+        status = ttk.Label(right, textvariable=status_var, foreground="#555")
+        status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14,0))
+
+        # Helpers
+        def refresh_profile_listbox(select_name: str | None = None) -> None:
+            profiles_listbox.delete(0, tk.END)
+            for p in PROFILES_STATE["profiles"]:
+                profiles_listbox.insert(tk.END, p["name"])
+            name = select_name or selected_name.get()
+            if name:
+                for i, p in enumerate(PROFILES_STATE["profiles"]):
+                    if p["name"] == name:
+                        profiles_listbox.selection_clear(0, tk.END)
+                        profiles_listbox.selection_set(i)
+                        profiles_listbox.activate(i)
+                        profiles_listbox.see(i)
+                        selected_name.set(name)
+                        break
+
+        def load_profile_into_fields(name: str) -> None:
+            profiles = PROFILES_STATE["profiles"]
+            prof = next((p for p in profiles if p["name"] == name), profiles[0] if profiles else {"url":"","username":"","password":""})
+            url_var.set(prof.get("url", ""))
+            user_var.set(prof.get("username", ""))
+            pwd_var.set(prof.get("password", ""))
+
+        def on_profile_select(_evt=None):
+            try:
+                sel = profiles_listbox.curselection()
+                if not sel:
+                    return
+                idx = sel[0]
+                name = PROFILES_STATE["profiles"][idx]["name"]
+                selected_name.set(name)
+                load_profile_into_fields(name)
+            except Exception:
+                pass
+
+        profiles_listbox.bind("<<ListboxSelect>>", on_profile_select)
+
+        # CRUD handlers
+        def on_create_profile():
+            profiles = PROFILES_STATE["profiles"]
+            base_name = "Новый профиль"
+            i = 1
+            existing = {p["name"] for p in profiles}
+            name = base_name
+            while name in existing:
+                i += 1
+                name = f"{base_name} {i}"
+            new_profile = {
+                "name": name,
+                "url": url_var.get().strip(),
+                "username": user_var.get().strip(),
+                "password": pwd_var.get().strip(),
+            }
+            profiles.append(new_profile)
+            save_profiles(profiles)
+            refresh_profile_listbox(select_name=name)
+            status_var.set("Профиль создан")
+
+        def on_rename_profile():
+            try:
+                import tkinter.simpledialog as sd
+                old = selected_name.get()
+                if not old:
+                    return
+                new_name = sd.askstring("Переименовать профиль", f"Новое имя для '{old}':", initialvalue=old)
+                if not new_name:
+                    return
+                for p in PROFILES_STATE["profiles"]:
+                    if p["name"] == old:
+                        p["name"] = new_name
+                        break
+                save_profiles(PROFILES_STATE["profiles"])
+                refresh_profile_listbox(select_name=new_name)
+                status_var.set("Профиль переименован")
+            except Exception:
+                pass
+
+        def on_delete_profile():
+            try:
+                import tkinter.messagebox as mb
+                name = selected_name.get()
+                if not name:
+                    return
+                if not mb.askyesno("Удалить профиль", f"Удалить профиль '{name}'?"):
+                    return
+                PROFILES_STATE["profiles"] = [p for p in PROFILES_STATE["profiles"] if p["name"] != name]
+                if not PROFILES_STATE["profiles"]:
+                    PROFILES_STATE["profiles"] = get_default_profiles()
+                save_profiles(PROFILES_STATE["profiles"])
+                refresh_profile_listbox(select_name=PROFILES_STATE["profiles"][0]["name"])
+                load_profile_into_fields(selected_name.get())
+                status_var.set("Профиль удалён")
+            except Exception:
+                pass
+
+        create_btn.configure(command=on_create_profile)
+        rename_btn.configure(command=on_rename_profile)
+        delete_btn.configure(command=on_delete_profile)
+
+        # Start/Pause
+        def on_speed_change(_evt=None):
+            try:
+                SPEED_STATE["value"] = float(speed_var.get() or 1.0)
+                speed_value_lbl.configure(text=f"{SPEED_STATE['value']:.1f}")
+            except Exception:
+                pass
+        speed_scale.configure(command=lambda v: on_speed_change())
 
         def on_start():
             try:
-                # Применяем настройки
                 SPEED_STATE["value"] = float(speed_var.get() or 1.0)
             except Exception:
                 SPEED_STATE["value"] = 1.0
-            # Применяем пресет (если выбран)
-            selected = next((p for p in PRESETS if p["name"] == preset_var.get()), PRESETS[0])
-            # Подставляем значения из пресета, если поля пустые
-            if not url_var.get().strip():
-                url_var.set(selected["url"]) 
-            if not user_var.get().strip():
-                user_var.set(selected["username"]) 
-            if not pwd_var.get().strip():
-                pwd_var.set(selected["password"]) 
-
+            STOP_FLAG["stop"] = False
+            ACTIVE_PROFILE_NAME["name"] = selected_name.get()
             os.environ["SP_USERNAME"] = user_var.get().strip()
             os.environ["SP_PASSWORD"] = pwd_var.get().strip()
             global START_URL
             START_URL = url_var.get().strip() or START_URL
             status_var.set("Запущено… окно можно оставить открытым и менять скорость")
             start_btn.config(state="disabled")
-
-            # Запускаем бота в фоне
-            Thread(target=lambda: asyncio.run(main()), daemon=True).start()
-            # Подсказка про форс‑логин
+            stop_btn.config(state="normal", text="Пауза")
             os.environ[FORCE_LOGIN_ENV] = "1" if (os.environ.get("SP_USERNAME") or os.environ.get("SP_PASSWORD")) else "0"
+            Thread(target=lambda: asyncio.run(main()), daemon=True).start()
 
-        start_btn = tk.Button(root, text="Запустить", command=on_start)
-        start_btn.grid(row=6, column=0, columnspan=2, padx=8, pady=(6,10))
+        def on_stop():
+            if STOP_FLAG["stop"]:
+                STOP_FLAG["stop"] = False
+                status_var.set("Продолжаю…")
+                stop_btn.config(text="Пауза")
+            else:
+                STOP_FLAG["stop"] = True
+                status_var.set("Пауза")
+                stop_btn.config(text="Продолжить")
 
-        # Инициализируем поля значениями выбранного пресета
-        on_preset_change(preset_var.get())
+        start_btn.configure(command=on_start)
+        stop_btn.configure(command=on_stop)
 
+        # Initialize
+        refresh_profile_listbox()
+        if selected_name.get():
+            load_profile_into_fields(selected_name.get())
+
+        def poll():
+            # Buttons state
+            if BOT_STATE["running"]:
+                status_var.set("Работает… можно менять скорость или нажать Пауза")
+                stop_btn.config(state="normal")
+                start_btn.config(state="disabled")
+            else:
+                if STOP_FLAG["stop"]:
+                    status_var.set("Остановлено")
+                else:
+                    status_var.set("Готов к запуску")
+                start_btn.config(state="normal")
+                stop_btn.config(state="disabled")
+            # Auto-save current fields into selected profile
+            try:
+                name = selected_name.get()
+                for p in PROFILES_STATE["profiles"]:
+                    if p["name"] == name:
+                        p["url"] = url_var.get().strip()
+                        p["username"] = user_var.get().strip()
+                        p["password"] = pwd_var.get().strip()
+                        break
+                save_profiles(PROFILES_STATE["profiles"])
+            except Exception:
+                pass
+            root.after(400, poll)
+
+        poll()
         root.mainloop()
     except Exception:
-        # Фоллбэк без GUI
         asyncio.run(main())
 
-if __name__ == "__main__":
+def run() -> None:
+    """Точка входа пакета."""
     run_control_panel_main_thread()
+
+

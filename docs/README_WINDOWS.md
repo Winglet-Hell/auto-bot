@@ -4,13 +4,8 @@
 2) Откройте PowerShell и выполните:
 
 ```
-cd "C:\Users\Stepin\Documents"  # путь к папке с проектом
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-python .\trans_saver.py
+cd "C:\path\to\auto-bot"  # путь к папке с проектом
+scripts\windows\run_bot.bat
 ```
 
 Если активация виртуалки заблокирована политикой:
@@ -21,4 +16,6 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Подсказки:
 - Для локального адреса `smartplayer1.neftm.local` убедитесь, что он резолвится (при необходимости добавьте в hosts).
-- Первое `python -m playwright install chromium` скачает Chromium; далее не требуется.
+- Первый запуск скачает Chromium автоматически; далее не требуется.
+
+
