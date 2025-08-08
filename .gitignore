@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual environments
+.venv/
+venv/
+
+# Playwright/Browser caches
+playwright/.cache/
+
+# Local runtime state
+state.json
+.env
+
+# OS
+.DS_Store
+Thumbs.db
