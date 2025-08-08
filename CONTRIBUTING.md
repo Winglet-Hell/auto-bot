@@ -25,3 +25,4 @@ pip install -r requirements.txt
 - Проверяйте, что всё запускается локально
 
 
+

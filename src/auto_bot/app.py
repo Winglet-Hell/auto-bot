@@ -4,12 +4,39 @@ import time
 import json
 import re
 from urllib.parse import urlsplit, urlunsplit
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from threading import Thread
+from queue import Queue, Empty
+
+# Ленивая поддержка Playwright: не падаем, если пакет не установлен (например, на Python 3.13)
+try:  # noqa: SIM105
+    from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+except Exception:  # ModuleNotFoundError и прочее
+    async_playwright = None  # type: ignore[assignment]
+
+    class _DummyTimeoutError(Exception):
+        pass
+
+    PWTimeout = _DummyTimeoutError  # type: ignore[assignment]
+
+# Необязательная поддержка анимированного GIF (Pikachu)
+try:  # noqa: SIM105
+    from PIL import Image, ImageTk  # type: ignore
+except Exception:
+    Image = None  # type: ignore
+    ImageTk = None  # type: ignore
 
 # Простой логгер
 def log(message: str) -> None:
     print(f"[bot] {message}", flush=True)
+    # Отдельный, более дружелюбный к пользователю текст — для окна статуса
+    try:
+        friendly = make_user_friendly_log(message)
+        # не спамим одинаковыми сообщениями подряд
+        if LAST_UI_LOG.get("msg") != friendly:
+            LAST_UI_LOG["msg"] = friendly
+            LOG_QUEUE.put_nowait(friendly)
+    except Exception:
+        pass
 
 # Поддержка .env (необязательно). Если нет библиотеки, просто игнорируем
 try:
@@ -79,6 +106,7 @@ GRID_SCROLL_SELECTOR = os.getenv("GRID_SCROLL_SELECTOR", "")
 # Предустановленные пресеты (можно расширять)
 PROFILES_PATH = os.getenv("PROFILES_PATH", "var/profiles.json")
 PROFILES_STATE: dict[str, list[dict[str, str]]] = {"profiles": []}
+UI_STATE_PATH = os.getenv("UI_STATE_PATH", "var/ui.json")
 
 def get_default_profiles() -> list[dict[str, str]]:
     return [
@@ -127,6 +155,26 @@ def save_profiles(profiles: list[dict[str, str]]) -> None:
         pass
     PROFILES_STATE["profiles"] = profiles
 
+def load_ui_state() -> dict:
+    try:
+        with open(UI_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+def save_ui_state(state: dict) -> None:
+    try:
+        d = os.path.dirname(UI_STATE_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(UI_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 async def highlight_locator(page, locator):
     if not SHOW_CLICKS:
         return
@@ -149,6 +197,121 @@ SPEED_STATE = {"value": SPEED_DEFAULT}
 STOP_FLAG = {"stop": False}
 BOT_STATE = {"running": False}
 ACTIVE_PROFILE_NAME = {"name": "Аккаунт 1"}
+RATE_PER_HOUR_AT_1X = int(os.getenv("RATE_PER_HOUR_AT_1X", "120"))  # базовая оценка карточек/час на скорости 1x
+LOG_QUEUE: Queue = Queue(maxsize=200)
+LAST_UI_LOG: dict[str, str] = {"msg": ""}
+
+def make_user_friendly_log(raw: str) -> str:
+    """Преобразует технический лог в короткое понятное сообщение."""
+    try:
+        text = raw.strip()
+        # Частые кейсы
+        patterns: list[tuple[str, str]] = [
+            ("Запускаю браузер Chromium", "Открываю браузер…"),
+            ("Открыл страницу:", "Открыл стартовую страницу"),
+            ("Пробую авто‑логин", "Выполняю вход…"),
+            ("Уже авторизованы", "Вход выполнен"),
+            ("Авто‑логин успешен", "Вход выполнен"),
+            ("Авто‑логин неуспешен", "Не удалось войти автоматически"),
+            ("Ожидаю ручной вход", "Ожидаю ваш вход…"),
+            ("Сессия сохранена", "Сессия сохранена"),
+            ("Найдено карточек", "Нашёл карточки на странице"),
+            ("Открываю карточку", "Открываю карточку…"),
+            ("Нажал Сохранить", "Сохраняю…"),
+            ("Получил подтверждение сохранения", "Сохранено"),
+            ("Карточка закрылась автоматически", "Карточка закрыта"),
+            ("Похоже, конец списка", "Список закончился — начинаю заново"),
+            ("Ошибка", "Произошла ошибка — продолжаю"),
+        ]
+        for needle, friendly in patterns:
+            if needle in text:
+                return friendly
+        # Укорачиваем длинные технические строки
+        if len(text) > 100:
+            text = text[:97] + "…"
+        return text
+    except Exception:
+        return raw
+
+# ===== Pikachu animation helpers =====
+_PIKACHU_FRAMES: list | None = None
+_PIKACHU_FRAME_MS: int = 90
+_PIKACHU_AFTER: dict = {"id": None, "label": None}
+_PIKACHU_ANIMATING: dict[str, bool] = {"on": False}
+
+def _load_pikachu_frames() -> list:
+    if Image is None or ImageTk is None:
+        return []
+    try:
+        gif_path = os.getenv("PIKACHU_GIF", os.path.join(os.path.dirname(__file__), "pikachu.gif"))
+        if not os.path.exists(gif_path):
+            return []
+        img = Image.open(gif_path)
+        # Determine frame delay and scaling
+        base_ms = int(img.info.get("duration", 100))
+        try:
+            # По умолчанию делаем в 2 раза медленнее базового gif
+            default_ms = int(base_ms * 2)
+            custom_ms = int(float(os.getenv("PIKACHU_FRAME_MS", str(default_ms))))
+        except Exception:
+            custom_ms = int(base_ms * 2)
+        # Clamp to reasonable range to avoid jerky animation
+        global _PIKACHU_FRAME_MS
+        _PIKACHU_FRAME_MS = max(120, min(custom_ms, 600))
+
+        try:
+            scale = max(1.0, min(5.0, float(os.getenv("PIKACHU_SCALE", "2.5"))))
+        except Exception:
+            scale = 2.5
+        frames: list = []
+        try:
+            while True:
+                frame = img.copy().convert("RGBA")
+                new_size = (int(frame.width * scale), int(frame.height * scale))
+                frame = frame.resize(new_size, Image.NEAREST)
+                frames.append(ImageTk.PhotoImage(frame))
+                img.seek(img.tell() + 1)
+        except Exception:
+            pass
+        return frames
+    except Exception:
+        return []
+
+def start_pikachu_animation(target_label) -> None:
+    global _PIKACHU_FRAMES
+    if _PIKACHU_FRAMES is None:
+        _PIKACHU_FRAMES = _load_pikachu_frames()
+    if not _PIKACHU_FRAMES:
+        return
+    # Если уже анимируем на том же label — ничего не делаем, чтобы не перезапускать на кадр 0
+    if _PIKACHU_ANIMATING.get("on") and _PIKACHU_AFTER.get("label") is target_label:
+        return
+    # Иначе, останавливаем прошлую анимацию (если была) и запускаем новую
+    stop_pikachu_animation()
+    _PIKACHU_ANIMATING["on"] = True
+    _PIKACHU_AFTER["label"] = target_label
+
+    def _loop(idx: int = 0) -> None:
+        if not _PIKACHU_ANIMATING["on"]:
+            return
+        try:
+            target_label.configure(image=_PIKACHU_FRAMES[idx % len(_PIKACHU_FRAMES)])
+            target_label.image = _PIKACHU_FRAMES[idx % len(_PIKACHU_FRAMES)]  # keep ref
+            _PIKACHU_AFTER["id"] = target_label.after(_PIKACHU_FRAME_MS, lambda: _loop(idx + 1))
+        except Exception:
+            pass
+
+    _loop(0)
+
+def stop_pikachu_animation() -> None:
+    try:
+        if _PIKACHU_AFTER.get("id") and _PIKACHU_AFTER.get("label") is not None:
+            _PIKACHU_AFTER["label"].after_cancel(_PIKACHU_AFTER["id"])  # type: ignore
+    except Exception:
+        pass
+    _PIKACHU_AFTER["id"] = None
+    _PIKACHU_AFTER["label"] = None
+    _PIKACHU_ANIMATING["on"] = False
 
 def TO(ms: int) -> int:
     # Таймауты: уменьшаем при увеличении скорости, но не ниже 500 мс
@@ -160,42 +323,93 @@ def AD(ms: int) -> int:
     factor = SPEED_STATE["value"] if SPEED_STATE["value"] > 0 else 1.0
     return max(50, int(ms / factor))
 
+def estimate_rate_per_hour() -> int:
+    try:
+        base = RATE_PER_HOUR_AT_1X if RATE_PER_HOUR_AT_1X > 0 else 1
+        speed = SPEED_STATE["value"] if SPEED_STATE["value"] > 0 else 1.0
+        return max(1, int(round(base * speed)))
+    except Exception:
+        return max(1, RATE_PER_HOUR_AT_1X)
+
 def request_stop() -> None:
     STOP_FLAG["stop"] = True
 
 def run_speed_slider_ui_main_thread(start_bot_callable) -> None:
     """Запускает Tkinter-слайдер в главном потоке, а бота — в отдельном."""
     try:
-        import tkinter as tk
+        # Пытаемся использовать современный скруглённый UI через CustomTkinter
+        import customtkinter as ctk  # type: ignore
 
         # Запускаем бота в отдельном потоке (daemon), чтобы окно UI не блокировалось
         Thread(target=start_bot_callable, daemon=True).start()
 
-        root = tk.Tk()
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("blue")
+
+        root = ctk.CTk()
         root.title("Auto Bot Speed")
-        tk.Label(root, text="Speed (x)").pack(pady=(8,0))
-        scale = tk.Scale(
-            root,
+
+        wrapper = ctk.CTkFrame(root, corner_radius=14, padx=14, pady=14)
+        wrapper.pack(fill="both", expand=True)
+
+        title = ctk.CTkLabel(wrapper, text="Скорость (x)", font=("", 13, "bold"))
+        title.pack(anchor="w", pady=(0, 8))
+
+        value_lbl = ctk.CTkLabel(wrapper, text=f"{SPEED_STATE['value']:.1f}")
+        value_lbl.pack(anchor="w", pady=(0, 8))
+
+        scale_var = ctk.DoubleVar(value=SPEED_STATE["value"])  # type: ignore
+        scale = ctk.CTkSlider(
+            wrapper,
             from_=0.2,
             to=3.0,
-            orient="horizontal",
-            resolution=0.1,
-            length=320,
+            number_of_steps=28,
+            corner_radius=10,
+            variable=scale_var,
+            width=360,
         )
-        scale.set(SPEED_STATE["value"])
+        scale.pack(fill="x")
 
-        def on_change(val: str):
+        def on_change(_val: float | str = 0) -> None:  # noqa: ANN001
             try:
-                SPEED_STATE["value"] = float(val)
+                SPEED_STATE["value"] = float(scale_var.get())
+                value_lbl.configure(text=f"{SPEED_STATE['value']:.1f}")
             except Exception:
                 pass
 
         scale.configure(command=on_change)
-        scale.pack(padx=10, pady=8)
         root.mainloop()
     except Exception:
-        # Если не получилось поднять UI (например, без GUI), просто стартуем бота
-        start_bot_callable()
+        # Фолбэк: обычный Tk/ttk
+        try:
+            import tkinter as tk
+        except Exception:
+            start_bot_callable()
+        else:
+            Thread(target=start_bot_callable, daemon=True).start()
+
+            root = tk.Tk()
+            root.title("Auto Bot Speed")
+            tk.Label(root, text="Speed (x)").pack(pady=(8, 0))
+            scale = tk.Scale(
+                root,
+                from_=0.2,
+                to=3.0,
+                orient="horizontal",
+                resolution=0.1,
+                length=320,
+            )
+            scale.set(SPEED_STATE["value"])
+
+            def on_change(val: str):
+                try:
+                    SPEED_STATE["value"] = float(val)
+                except Exception:
+                    pass
+
+            scale.configure(command=on_change)
+            scale.pack(padx=10, pady=8)
+            root.mainloop()
 
 async def wait_card_open(page) -> bool:
     """Проверяем, что карточка открылась по любому из признаков."""
@@ -618,6 +832,10 @@ async def process_all(page):
                 continue
 
 async def main():
+    # Проверяем, доступен ли Playwright
+    if async_playwright is None:
+        log("Playwright не установлен — установите зависимости через scripts/run_bot.sh")
+        return
     BOT_STATE["running"] = True
     try:
         async with async_playwright() as p:
@@ -729,7 +947,435 @@ async def main():
         BOT_STATE["running"] = False
 
 def run_control_panel_main_thread() -> None:
-    """Modernized GUI using ttk with profiles sidebar and details pane."""
+    """Графический интерфейс управления. Скруглённый UI на CustomTkinter, с фолбэком на ttk."""
+    # Сначала пытаемся запустить скруглённый UI
+    try:
+        import customtkinter as ctk  # type: ignore
+        import tkinter as tk
+        # Стили
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("blue")
+
+        root = ctk.CTk()
+        root.title("Управление Auto Bot")
+        try:
+            root.iconify(); root.update(); root.deiconify()
+        except Exception:
+            pass
+        # Fixed window size (non-resizable)
+        root.geometry("960x560")
+        root.minsize(960, 560)
+        root.maxsize(960, 560)
+        try:
+            root.resizable(False, False)
+        except Exception:
+            pass
+        root.grid_columnconfigure(0, weight=0)
+        root.grid_columnconfigure(1, weight=1)
+        root.grid_rowconfigure(0, weight=1)
+
+        # State
+        PROFILES_STATE["profiles"] = load_profiles()
+        url_var = tk.StringVar()
+        user_var = tk.StringVar()
+        pwd_var = tk.StringVar()
+        speed_var = tk.DoubleVar(value=SPEED_STATE["value"])  # type: ignore[assignment]
+        selected_name = tk.StringVar(value=PROFILES_STATE["profiles"][0]["name"] if PROFILES_STATE["profiles"] else "")
+
+        # Left panel (rounded frame)
+        left = ctk.CTkFrame(root, corner_radius=14, fg_color=("#F5F6F8", "#1f1f1f"), width=280)
+        left.grid(row=0, column=0, sticky="nsw", padx=(14, 8), pady=14)
+        left.grid_propagate(False)
+        # rows: title, selector, actions, spacer
+        left.grid_rowconfigure(3, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_columnconfigure(1, weight=0)
+        left.grid_columnconfigure(2, weight=0)
+
+        ctk.CTkLabel(left, text="Профили", font=("", 13, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 8))
+
+        def profiles_names() -> list[str]:
+            return [p["name"] for p in PROFILES_STATE["profiles"]]
+
+        profiles_menu = ctk.CTkOptionMenu(
+            left,
+            variable=selected_name,
+            values=profiles_names() or [""],
+            corner_radius=10,
+        )
+        profiles_menu.grid(row=1, column=0, sticky="ew", padx=(12, 6))
+        plus_btn = ctk.CTkButton(left, text="+", width=36, corner_radius=8)
+        minus_btn = ctk.CTkButton(left, text="−", width=36, corner_radius=8, fg_color="#ef4444", hover_color="#dc2626")
+        plus_btn.grid(row=1, column=1, padx=(0, 6))
+        minus_btn.grid(row=1, column=2, padx=(0, 12))
+
+        # Rename remains as a separate full-width action
+        rename_btn = ctk.CTkButton(left, text="Переименовать", corner_radius=10)
+        rename_btn.grid(row=2, column=0, columnspan=3, sticky="ew", padx=12, pady=10)
+
+        # Pikachu GIF area (left large box)
+        pikachu_frame = ctk.CTkFrame(left, corner_radius=12, fg_color=("#ECEFF1", "#1a1a1a"), width=260, height=360)
+        pikachu_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=12, pady=(4, 12))
+        pikachu_frame.grid_propagate(False)
+        pikachu_label = ctk.CTkLabel(pikachu_frame, text="")
+        pikachu_label.place(relx=0.5, rely=0.5, anchor="center")
+        # Try show first frame immediately or hint
+        try:
+            global _PIKACHU_FRAMES
+            if _PIKACHU_FRAMES is None:
+                _PIKACHU_FRAMES = _load_pikachu_frames()
+            if _PIKACHU_FRAMES:
+                pikachu_label.configure(image=_PIKACHU_FRAMES[0])
+                pikachu_label.image = _PIKACHU_FRAMES[0]
+            else:
+                hint = "Добавьте pikachu.gif в src/auto_bot/\nили укажите PIKACHU_GIF"
+                pikachu_label.configure(text=hint, justify="center", text_color="#7a7a7a")
+        except Exception:
+            pass
+
+        # Right panel (rounded frame)
+        # Right panel
+        right = ctk.CTkFrame(root, corner_radius=14, fg_color=("#FFFFFF", "#111111"))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 14), pady=14)
+        for i in range(11):
+            right.grid_rowconfigure(i, weight=0)
+        right.grid_rowconfigure(9, weight=1)
+        right.grid_columnconfigure(0, weight=0)
+        right.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(right, text="Детали профиля", font=("", 13, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(16, 8))
+
+        ctk.CTkLabel(right, text="Ссылка для входа").grid(row=1, column=0, sticky="w", padx=16, pady=(4, 4))
+        url_entry = ctk.CTkEntry(right, textvariable=url_var, corner_radius=10, placeholder_text="https://…")
+        url_entry.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=(4, 4))
+
+        ctk.CTkLabel(right, text="Логин").grid(row=2, column=0, sticky="w", padx=16, pady=4)
+        user_entry = ctk.CTkEntry(right, textvariable=user_var, corner_radius=10, placeholder_text="user@mail", width=360)
+        user_entry.grid(row=2, column=1, sticky="w", padx=(0, 16), pady=4)
+
+        ctk.CTkLabel(right, text="Пароль").grid(row=3, column=0, sticky="w", padx=16, pady=4)
+        pwd_row = ctk.CTkFrame(right, corner_radius=0, fg_color="transparent")
+        pwd_row.grid(row=3, column=1, sticky="w", padx=(0, 16), pady=4)
+        pwd_entry = ctk.CTkEntry(pwd_row, textvariable=pwd_var, corner_radius=10, show="*", placeholder_text="••••••••", width=360)
+        pwd_entry.pack(side="left")
+        # Show/Hide password toggle
+        def toggle_pwd():
+            try:
+                pwd_entry.configure(show="" if (pwd_entry.cget("show") == "*") else "*")
+                eye_btn.configure(text="🙈" if pwd_entry.cget("show") == "" else "👁")
+            except Exception:
+                pass
+        eye_btn = ctk.CTkButton(pwd_row, text="👁", width=32, corner_radius=10, command=toggle_pwd)
+        eye_btn.pack(side="left", padx=(8, 0))
+
+        # Speed (transparent helper frame for lighter look)
+        speed_row = ctk.CTkFrame(right, corner_radius=10, fg_color="transparent")
+        speed_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=16, pady=(8, 6))
+        speed_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(speed_row, text="Скорость (x)").grid(row=0, column=0, sticky="w", pady=6)
+        speed_scale = ctk.CTkSlider(speed_row, from_=0.2, to=3.0, number_of_steps=28, variable=speed_var, corner_radius=10)
+        speed_scale.grid(row=0, column=1, sticky="ew", padx=(12, 12))
+        speed_value_lbl = ctk.CTkLabel(speed_row, text=f"{speed_var.get():.1f}")
+        speed_value_lbl.grid(row=0, column=2, sticky="e")
+
+        # Estimated throughput row
+        rate_row = ctk.CTkFrame(right, corner_radius=10, fg_color="transparent")
+        rate_row.grid(row=5, column=0, columnspan=2, sticky="ew", padx=16, pady=(2, 8))
+        rate_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(rate_row, text="Оценка производительности").grid(row=0, column=0, sticky="w")
+        rate_value_lbl = ctk.CTkLabel(rate_row, text=f"{estimate_rate_per_hour()} трансляций/час")
+        rate_value_lbl.grid(row=0, column=1, sticky="e")
+
+        # Controls
+        controls = ctk.CTkFrame(right, corner_radius=10, fg_color="transparent")
+        controls.grid(row=7, column=0, columnspan=2, sticky="ew", padx=16, pady=(6, 0))
+        controls.grid_columnconfigure(0, weight=1)
+        controls.grid_columnconfigure(1, weight=1)
+        start_btn = ctk.CTkButton(controls, text="Запустить", corner_radius=10)
+        stop_btn = ctk.CTkButton(controls, text="Пауза", corner_radius=10, state="disabled")
+        progress = ctk.CTkProgressBar(right)
+        progress.grid(row=6, column=0, columnspan=2, sticky="ew", padx=16)
+        progress.set(0)
+        start_btn.grid(row=0, column=0, padx=(0, 8), pady=8, sticky="ew")
+        stop_btn.grid(row=0, column=1, padx=(8, 0), pady=8, sticky="ew")
+
+        # Status
+        status_var = tk.StringVar(value="Выберите профиль, отредактируйте параметры и запустите")
+        status = ctk.CTkLabel(right, textvariable=status_var, text_color=("#555555", "#aaaaaa"))
+        status.grid(row=8, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 6))
+
+        # Large status/log panel (latest log replaces previous)
+        log_box = ctk.CTkTextbox(right, height=200, corner_radius=12)
+        log_box.grid(row=9, column=0, columnspan=2, sticky="nsew", padx=16, pady=(6, 14))
+        log_box.configure(state="disabled")
+
+        # Helpers
+        def refresh_profiles_menu(select_name: str | None = None) -> None:
+            names = profiles_names()
+            profiles_menu.configure(values=names or [""])
+            name = select_name or (names[0] if names else "")
+            if name:
+                selected_name.set(name)
+
+        def load_profile_into_fields(name: str) -> None:
+            profiles = PROFILES_STATE["profiles"]
+            prof = next((p for p in profiles if p["name"] == name), profiles[0] if profiles else {"url": "", "username": "", "password": ""})
+            url_var.set(prof.get("url", ""))
+            user_var.set(prof.get("username", ""))
+            pwd_var.set(prof.get("password", ""))
+
+        def on_profile_select(_value: str) -> None:
+            try:
+                name = selected_name.get()
+                if not name:
+                    return
+                load_profile_into_fields(name)
+            except Exception:
+                pass
+
+        profiles_menu.configure(command=on_profile_select)
+
+        # CRUD
+        def on_create_profile() -> None:
+            profiles = PROFILES_STATE["profiles"]
+            base_name = "Новый профиль"
+            i = 1
+            existing = {p["name"] for p in profiles}
+            name = base_name
+            while name in existing:
+                i += 1
+                name = f"{base_name} {i}"
+            new_profile = {
+                "name": name,
+                "url": url_var.get().strip(),
+                "username": user_var.get().strip(),
+                "password": pwd_var.get().strip(),
+            }
+            profiles.append(new_profile)
+            save_profiles(profiles)
+            refresh_profiles_menu(select_name=name)
+            status_var.set("Профиль создан")
+
+        def on_rename_profile() -> None:
+            try:
+                import tkinter.simpledialog as sd
+                old = selected_name.get()
+                if not old:
+                    return
+                new_name = sd.askstring("Переименовать профиль", f"Новое имя для '{old}':", initialvalue=old)
+                if not new_name:
+                    return
+                for p in PROFILES_STATE["profiles"]:
+                    if p["name"] == old:
+                        p["name"] = new_name
+                        break
+                save_profiles(PROFILES_STATE["profiles"])
+                refresh_profiles_menu(select_name=new_name)
+                status_var.set("Профиль переименован")
+            except Exception:
+                pass
+
+        def on_delete_profile() -> None:
+            try:
+                import tkinter.messagebox as mb
+                name = selected_name.get()
+                if not name:
+                    return
+                if not mb.askyesno("Удалить профиль", f"Удалить профиль '{name}'?"):
+                    return
+                PROFILES_STATE["profiles"] = [p for p in PROFILES_STATE["profiles"] if p["name"] != name]
+                if not PROFILES_STATE["profiles"]:
+                    PROFILES_STATE["profiles"] = get_default_profiles()
+                save_profiles(PROFILES_STATE["profiles"])
+                refresh_profiles_menu(select_name=PROFILES_STATE["profiles"][0]["name"])
+                load_profile_into_fields(selected_name.get())
+                status_var.set("Профиль удалён")
+            except Exception:
+                pass
+
+        # Bind actions
+        rename_btn.configure(command=on_rename_profile)
+        # map plus/minus buttons
+        try:
+            plus_btn.configure(command=on_create_profile)
+            minus_btn.configure(command=on_delete_profile)
+        except Exception:
+            pass
+
+        # Keyboard shortcuts
+        def bind_shortcuts(widget):
+            try:
+                widget.bind_all("<Command-r>", lambda _e: on_start())
+                widget.bind_all("<Control-r>", lambda _e: on_start())
+                widget.bind_all("<space>", lambda _e: on_stop())
+                widget.bind_all("<Command-s>", lambda _e: save_profiles(PROFILES_STATE["profiles"]))
+                widget.bind_all("<Control-s>", lambda _e: save_profiles(PROFILES_STATE["profiles"]))
+                widget.bind_all("<Up>", lambda _e: profiles_menu.set(profiles_names()[max(0, profiles_names().index(selected_name.get()) - 1)]) if profiles_names() else None)
+                widget.bind_all("<Down>", lambda _e: profiles_menu.set(profiles_names()[min(len(profiles_names()) - 1, profiles_names().index(selected_name.get()) + 1)]) if profiles_names() else None)
+            except Exception:
+                pass
+
+        bind_shortcuts(root)
+
+        # Start/Pause
+        def on_speed_change(_val: float | str = 0) -> None:  # noqa: ANN001
+            try:
+                SPEED_STATE["value"] = float(speed_var.get() or 1.0)
+                speed_value_lbl.configure(text=f"{SPEED_STATE['value']:.1f}")
+                rate_value_lbl.configure(text=f"{estimate_rate_per_hour()} трансляций/час")
+            except Exception:
+                pass
+        speed_scale.configure(command=on_speed_change)
+
+        def on_start() -> None:
+            try:
+                SPEED_STATE["value"] = float(speed_var.get() or 1.0)
+            except Exception:
+                SPEED_STATE["value"] = 1.0
+            STOP_FLAG["stop"] = False
+            ACTIVE_PROFILE_NAME["name"] = selected_name.get()
+            os.environ["SP_USERNAME"] = user_var.get().strip()
+            os.environ["SP_PASSWORD"] = pwd_var.get().strip()
+            global START_URL
+            START_URL = url_var.get().strip() or START_URL
+            status_var.set("Запущено… окно можно оставить открытым и менять скорость")
+            start_btn.configure(state="disabled")
+            stop_btn.configure(state="normal", text="Пауза")
+            try:
+                progress.configure(mode="indeterminate")
+                progress.start()
+            except Exception:
+                pass
+            # Start Pikachu animation if available
+            try:
+                start_pikachu_animation(pikachu_label)
+            except Exception:
+                pass
+            os.environ[FORCE_LOGIN_ENV] = "1" if (os.environ.get("SP_USERNAME") or os.environ.get("SP_PASSWORD")) else "0"
+            Thread(target=lambda: asyncio.run(main()), daemon=True).start()
+
+        def on_stop() -> None:
+            if STOP_FLAG["stop"]:
+                STOP_FLAG["stop"] = False
+                status_var.set("Продолжаю…")
+                stop_btn.configure(text="Пауза")
+            else:
+                STOP_FLAG["stop"] = True
+                status_var.set("Пауза")
+                stop_btn.configure(text="Продолжить")
+            try:
+                if STOP_FLAG["stop"]:
+                    stop_pikachu_animation()
+                else:
+                    start_pikachu_animation(pikachu_label)
+            except Exception:
+                pass
+
+        start_btn.configure(command=on_start)
+        stop_btn.configure(command=on_stop)
+
+        # Initialize (restore UI state)
+        saved = load_ui_state()
+        # Фиксированный размер не меняем из сохранённого состояния
+        refresh_profiles_menu()
+        if saved.get("selected_profile"):
+            selected_name.set(saved["selected_profile"]) 
+        if selected_name.get():
+            load_profile_into_fields(selected_name.get())
+        did_initial_load = {"done": True}
+
+        def poll() -> None:
+            # Buttons state
+            if BOT_STATE["running"]:
+                status_var.set("Работает… можно менять скорость или нажать Пауза")
+                stop_btn.configure(state="normal")
+                start_btn.configure(state="disabled")
+                try:
+                    progress.configure(mode="indeterminate")
+                    progress.start()
+                except Exception:
+                    pass
+            else:
+                if STOP_FLAG["stop"]:
+                    status_var.set("Остановлено")
+                else:
+                    status_var.set("Готов к запуску")
+                start_btn.configure(state="normal")
+                stop_btn.configure(state="disabled")
+                try:
+                    progress.stop()
+                    progress.set(0)
+                    progress.configure(mode="determinate")
+                except Exception:
+                    pass
+            # Animate pikachu according to state
+            try:
+                if BOT_STATE["running"] and not STOP_FLAG["stop"]:
+                    start_pikachu_animation(pikachu_label)
+                else:
+                    stop_pikachu_animation()
+            except Exception:
+                pass
+            # Auto-save current fields into selected profile (safe, without wiping non-empty values to empty)
+            try:
+                name = selected_name.get()
+                for p in PROFILES_STATE["profiles"]:
+                    if p["name"] == name:
+                        current_url = url_var.get().strip()
+                        current_user = user_var.get().strip()
+                        current_pwd = pwd_var.get().strip()
+                        # Не перезаписываем заполненные значения пустыми
+                        all_empty = not current_url and not current_user and not current_pwd
+                        changed = (
+                            current_url != p.get("url", "") or
+                            current_user != p.get("username", "") or
+                            current_pwd != p.get("password", "")
+                        )
+                        if did_initial_load.get("done") and changed and (not all_empty or not (p.get("url") or p.get("username") or p.get("password"))):
+                            p["url"] = current_url
+                            p["username"] = current_user
+                            p["password"] = current_pwd
+                            save_profiles(PROFILES_STATE["profiles"])
+                        break
+                # keep rate in sync if something changed speed externally
+                rate_value_lbl.configure(text=f"{estimate_rate_per_hour()} трансляций/час")
+                # drain log queue and show last line only in the big textbox
+                last_msg = None
+                try:
+                    while True:
+                        last_msg = LOG_QUEUE.get_nowait()
+                except Empty:
+                    pass
+                if last_msg is not None:
+                    try:
+                        log_box.configure(state="normal")
+                        log_box.delete("1.0", "end")
+                        log_box.insert("end", last_msg)
+                        log_box.configure(state="disabled")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            root.after(400, poll)
+
+        poll()
+
+        def persist_ui_state():
+            try:
+                save_ui_state({
+                    "selected_profile": selected_name.get(),
+                })
+            except Exception:
+                pass
+
+        root.protocol("WM_DELETE_WINDOW", lambda: (persist_ui_state(), root.destroy()))
+        root.mainloop()
+        return
+    except ImportError:
+        # Фолбэк: старый UI на ttk
+        pass
+
+    # Fallback UI (ttk)
     try:
         import tkinter as tk
         from tkinter import ttk
@@ -745,7 +1391,6 @@ def run_control_panel_main_thread() -> None:
         root.columnconfigure(0, weight=0)
         root.columnconfigure(1, weight=1)
 
-        # Use a nicer theme if available
         try:
             style = ttk.Style()
             for theme in ("aqua", "clam", "default"):
@@ -755,7 +1400,6 @@ def run_control_panel_main_thread() -> None:
         except Exception:
             pass
 
-        # State
         PROFILES_STATE["profiles"] = load_profiles()
         url_var = tk.StringVar()
         user_var = tk.StringVar()
@@ -763,28 +1407,26 @@ def run_control_panel_main_thread() -> None:
         speed_var = tk.DoubleVar(value=SPEED_STATE["value"])
         selected_name = tk.StringVar(value=PROFILES_STATE["profiles"][0]["name"] if PROFILES_STATE["profiles"] else "")
 
-        # Left: profiles
-        left = ttk.Frame(root, padding=(10,10,6,10))
+        left = ttk.Frame(root, padding=(10, 10, 6, 10))
         left.grid(row=0, column=0, sticky="nsw")
         left.rowconfigure(1, weight=1)
         ttk.Label(left, text="Профили", font=("", 11, "bold")).grid(row=0, column=0, sticky="w")
         profiles_listbox = tk.Listbox(left, height=14, activestyle="dotbox")
         profiles_scroll = ttk.Scrollbar(left, orient="vertical", command=profiles_listbox.yview)
         profiles_listbox.configure(yscrollcommand=profiles_scroll.set)
-        profiles_listbox.grid(row=1, column=0, sticky="nsew", pady=(6,6))
-        profiles_scroll.grid(row=1, column=1, sticky="ns", pady=(6,6), padx=(6,0))
+        profiles_listbox.grid(row=1, column=0, sticky="nsew", pady=(6, 6))
+        profiles_scroll.grid(row=1, column=1, sticky="ns", pady=(6, 6), padx=(6, 0))
 
         btns = ttk.Frame(left)
         btns.grid(row=2, column=0, columnspan=2, sticky="ew")
         create_btn = ttk.Button(btns, text="Создать")
         rename_btn = ttk.Button(btns, text="Переименовать")
         delete_btn = ttk.Button(btns, text="Удалить")
-        create_btn.grid(row=0, column=0, padx=(0,6))
-        rename_btn.grid(row=0, column=1, padx=(0,6))
+        create_btn.grid(row=0, column=0, padx=(0, 6))
+        rename_btn.grid(row=0, column=1, padx=(0, 6))
         delete_btn.grid(row=0, column=2)
 
-        # Right: details
-        right = ttk.Frame(root, padding=(6,10,10,10))
+        right = ttk.Frame(root, padding=(6, 10, 10, 10))
         right.grid(row=0, column=1, sticky="nsew")
         for i in range(6):
             right.rowconfigure(i, weight=0)
@@ -792,9 +1434,9 @@ def run_control_panel_main_thread() -> None:
         right.columnconfigure(1, weight=1)
 
         ttk.Label(right, text="Детали профиля", font=("", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(right, text="Ссылка для входа").grid(row=1, column=0, sticky="w", pady=(10,4))
+        ttk.Label(right, text="Ссылка для входа").grid(row=1, column=0, sticky="w", pady=(10, 4))
         url_entry = ttk.Entry(right, textvariable=url_var)
-        url_entry.grid(row=1, column=1, sticky="ew", pady=(10,4))
+        url_entry.grid(row=1, column=1, sticky="ew", pady=(10, 4))
 
         ttk.Label(right, text="Логин").grid(row=2, column=0, sticky="w", pady=4)
         user_entry = ttk.Entry(right, textvariable=user_var, width=40)
@@ -804,30 +1446,26 @@ def run_control_panel_main_thread() -> None:
         pwd_entry = ttk.Entry(right, textvariable=pwd_var, width=40)
         pwd_entry.grid(row=3, column=1, sticky="w", pady=4)
 
-        # Speed
         speed_row = ttk.Frame(right)
-        speed_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10,4))
+        speed_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 4))
         ttk.Label(speed_row, text="Скорость (x)").grid(row=0, column=0, sticky="w")
         speed_value_lbl = ttk.Label(speed_row, text=f"{speed_var.get():.1f}")
-        speed_value_lbl.grid(row=0, column=1, sticky="w", padx=(6,10))
+        speed_value_lbl.grid(row=0, column=1, sticky="w", padx=(6, 10))
         speed_scale = ttk.Scale(speed_row, from_=0.2, to=3.0, orient="horizontal", variable=speed_var, length=360)
         speed_scale.grid(row=0, column=2, sticky="ew")
         speed_row.columnconfigure(2, weight=1)
 
-        # Controls
         controls = ttk.Frame(right)
-        controls.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10,0))
+        controls.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
         start_btn = ttk.Button(controls, text="Запустить")
         stop_btn = ttk.Button(controls, text="Пауза", state="disabled")
-        start_btn.grid(row=0, column=0, padx=(0,8))
+        start_btn.grid(row=0, column=0, padx=(0, 8))
         stop_btn.grid(row=0, column=1)
 
-        # Status bar
         status_var = tk.StringVar(value="Выберите профиль слева, отредактируйте параметры и запустите")
         status = ttk.Label(right, textvariable=status_var, foreground="#555")
-        status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14,0))
+        status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
-        # Helpers
         def refresh_profile_listbox(select_name: str | None = None) -> None:
             profiles_listbox.delete(0, tk.END)
             for p in PROFILES_STATE["profiles"]:
@@ -845,7 +1483,7 @@ def run_control_panel_main_thread() -> None:
 
         def load_profile_into_fields(name: str) -> None:
             profiles = PROFILES_STATE["profiles"]
-            prof = next((p for p in profiles if p["name"] == name), profiles[0] if profiles else {"url":"","username":"","password":""})
+            prof = next((p for p in profiles if p["name"] == name), profiles[0] if profiles else {"url": "", "username": "", "password": ""})
             url_var.set(prof.get("url", ""))
             user_var.set(prof.get("username", ""))
             pwd_var.set(prof.get("password", ""))
@@ -864,7 +1502,6 @@ def run_control_panel_main_thread() -> None:
 
         profiles_listbox.bind("<<ListboxSelect>>", on_profile_select)
 
-        # CRUD handlers
         def on_create_profile():
             profiles = PROFILES_STATE["profiles"]
             base_name = "Новый профиль"
@@ -926,7 +1563,6 @@ def run_control_panel_main_thread() -> None:
         rename_btn.configure(command=on_rename_profile)
         delete_btn.configure(command=on_delete_profile)
 
-        # Start/Pause
         def on_speed_change(_evt=None):
             try:
                 SPEED_STATE["value"] = float(speed_var.get() or 1.0)
@@ -965,13 +1601,11 @@ def run_control_panel_main_thread() -> None:
         start_btn.configure(command=on_start)
         stop_btn.configure(command=on_stop)
 
-        # Initialize
         refresh_profile_listbox()
         if selected_name.get():
             load_profile_into_fields(selected_name.get())
 
         def poll():
-            # Buttons state
             if BOT_STATE["running"]:
                 status_var.set("Работает… можно менять скорость или нажать Пауза")
                 stop_btn.config(state="normal")
@@ -983,7 +1617,6 @@ def run_control_panel_main_thread() -> None:
                     status_var.set("Готов к запуску")
                 start_btn.config(state="normal")
                 stop_btn.config(state="disabled")
-            # Auto-save current fields into selected profile
             try:
                 name = selected_name.get()
                 for p in PROFILES_STATE["profiles"]:
