@@ -58,8 +58,8 @@ scripts/windows/run_only.bat
 - SP_USERNAME_SELECTOR / SP_PASSWORD_SELECTOR / SP_SUBMIT_SELECTOR — переопределение селекторов формы логина
 
 ### Скрипты
-- `scripts/run_bot.sh`, `scripts/run_only.sh` — macOS/Linux
-- `scripts/windows/run_bot.bat`, `scripts/windows/run_only.bat` — Windows
+- macOS/Linux: `scripts/run_bot.sh`, `scripts/run_only.sh` или из macOS‑папки `scripts/macos/run.sh` (двойной клик `scripts/macos/run.command`)
+- Windows: `scripts/windows/run_bot.bat`, `scripts/windows/run_only.bat`
 
 ### Структура проекта
 ```
@@ -71,6 +71,9 @@ auto-bot/
   scripts/
     run_bot.sh
     run_only.sh
+    macos/
+      run.sh
+      run.command
     windows/
       run_bot.bat
       run_only.bat
