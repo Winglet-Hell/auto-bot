@@ -18,7 +18,7 @@ if exist requirements.txt (
 
 python -m playwright install chromium
 
-set PYTHONPATH=.
-python -c "from src.auto_bot import run; run()"
+set PYTHONPATH=src
+python -c "from auto_bot import run; run()"
 
 

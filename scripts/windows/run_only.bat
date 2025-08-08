@@ -6,7 +6,7 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 call ".venv\Scripts\activate.bat"
-set PYTHONPATH=.
-python -c "from src.auto_bot import run; run()"
+set PYTHONPATH=src
+python -c "from auto_bot import run; run()"
 
 

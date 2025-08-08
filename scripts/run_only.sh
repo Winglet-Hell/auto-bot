@@ -8,6 +8,7 @@ if [[ ! -f .venv/bin/activate ]]; then
 fi
 
 source .venv/bin/activate
-PYTHONPATH=. python -c "from src.auto_bot import run; run()"
+export PYTHONPATH=src
+python -c "from auto_bot import run; run()"
 
 
